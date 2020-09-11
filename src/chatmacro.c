@@ -28,7 +28,16 @@
  *   Also, the macro file ("macros.txt") is also hardcoded. Some argument parsing or configuration
  *   would probably do this program well.
  *
- * NOTE
+ * ChatWheel NOTE
+ *
+ *   It's currently the case that we don't _really_ handle key releases particularly well. The main
+ *   thing we do, is basically, bring up the window on hotkey press, then wait for the SDL event
+ *   that says our "hotkey key" was released.
+ *
+ *   Also possible: run a shell command :)
+ *
+ *   It looks like, to create the overlay situation, just creating the window and destroying it
+ *   every time might be the most consistent way to do this. Not quite sure.
  *
  * TODO
  * 1. Minimize to Tray (Not Console Application)
@@ -40,40 +49,52 @@
 
 #define SDL_MAIN_HANDLED
 #include <SDL2/SDL.h>
+#include <SDL2/SDL_syswm.h>
 
 #define COMMON_IMPLEMENTATION
 #include "common.h"
 
-#define WIN32_LEAN_AND_MEAN
+// #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-#define MACRO_FILE ("macros.txt")
-
-struct bank_t {
-	char *name;
-	char **lines;
-	size_t lines_len, lines_cap;
-	s32 curr;
-};
+#define MACRO_FILE      ("macros.txt")
+#define WINDOW_TITLE    ("chatwheel")
+#define HOTKEY_TOGGLE   (VK_NUMPAD0)
+#define HOTKEY_QUIT     (VK_DECIMAL)
+#define SDL_WINDOW_PARAMS (SDL_WINDOW_FULLSCREEN_DESKTOP|SDL_WINDOW_BORDERLESS|SDL_WINDOW_MOUSE_CAPTURE)
 
 struct state_t {
-	struct bank_t *banks;
-	size_t banks_len, banks_cap;
-	s32 curr;
-	s32 s_bank;
-	s32 s_macro;
-	s32 quit;
+	// SDL Vals
+	SDL_Window *gWindow;
+	SDL_Renderer *gRenderer;
+
+	s32 display_w;
+	s32 display_h;
+
+	s32 nonce;
+
+	s32 curr; // @DEPRECATED current string
+	s32 is_running;
+	s32 is_active;
+
+	// Basically, replicate the DotA2 functionality, and save the user's mouse position
+	s32 mouse_bak_x;
+	s32 mouse_bak_y;
+
+	// regular mouse values
+	s32 mouse_x;
+	s32 mouse_y;
+
+	// macro text
+	char **lines;
+	size_t lines_len, lines_cap;
 };
 
 // NOTE (brian): the first three parameters are passed directly to RegisterHotkey
 struct hotkey_t {
-	u32 modifiers;
 	u32 vk;
-	s8 on_always;
-	s8 on_now;
-	s8 arg1;
-	s8 arg2;
-	s32 (*func)(struct state_t *state, struct hotkey_t *hotkeys, s32 len, s32 idx);
+	u32 modifiers;
+	s32 (*func)(struct state_t *state);
 };
 
 struct hotkey_event_arg_t {
@@ -85,53 +106,55 @@ struct hotkey_event_arg_t {
 /* sys_lasterror : handles errors that aren't propogated through win32 errno */
 static void sys_lasterror();
 
-/* macros_parse : parse macros from the input file to the state */
-s32 macros_parse(struct state_t *state, char *fname);
-/* state_dump : dumps the state of the 'state' object */
-s32 state_dump(struct state_t *state);
+/* macros_read : parse macros from the input file to the state */
+s32 macros_read(struct state_t *state, char *fname);
 
-/* hotkey_fn_toggle : toggles the availabliliy of the other hotkeys */
-s32 hotkey_fn_toggle(struct state_t *state, struct hotkey_t *hotkeys, s32 len, s32 idx);
+/* hotkey_fn_togglewheel : toggles the chat wheel & sets up SDL state for the wheel */
+s32 hotkey_fn_togglewheel(struct state_t *state);
 /* hotkey_fn_quit : toggles the availabliliy of the other hotkeys */
-s32 hotkey_fn_quit(struct state_t *state, struct hotkey_t *hotkeys, s32 len, s32 idx);
-/* hotkey_fn_swap : swaps between items */
-s32 hotkey_fn_swap(struct state_t *state, struct hotkey_t *hotkeys, s32 len, s32 idx);
+s32 hotkey_fn_quit(struct state_t *state);
 /* hotkey_fn_macro : swaps between macros in the bank */
-s32 hotkey_fn_macro(struct state_t *state, struct hotkey_t *hotkeys, s32 len, s32 idx);
+s32 hotkey_fn_macro(struct state_t *state);
 /* hotkey_fn_say : says the selected macro */
-s32 hotkey_fn_say(struct state_t *state, struct hotkey_t *hotkeys, s32 len, s32 idx);
+s32 hotkey_fn_say(struct state_t *state);
 
 /* mk_kbdinput : helper function to fill in an INPUT structure for a keyboard */
 void mk_kbdinput(INPUT *input, s16 vk, s16 sk, s32 key_up);
 /* sendkey_single : sends a single key */
 s32 sendkey_single(s32 keycode);
 
+// Rendering Functions
+/* Render : renders the transparent screen */
+s32 Render(struct state_t *state);
+
 // WIN32 Custom
 /* Win32_CustomEventHandler : custom event handler to grab windows events in sdl */
 void Win32_CustomEventHandler(void *user, void *hwnd, u32 message, u64 wparam, s64 lparam);
+/* Win32_MakeWindowTransparent : makes the sdl window transparent */
+int Win32_MakeWindowTransparent(SDL_Window *window, u8 r, u8 g, u8 b);
+/* Win32_SetWindowPos : sets the window's z order */
+int Win32_SetWindowPos(SDL_Window *window, s32 x, s32 y, s32 w, s32 h, s32 is_top);
+/* Win32_GetWindowHWND : get the window handle */
+HWND Win32_GetWindowHWND(SDL_Window *window);
 
 int main(int argc, char **argv)
 {
+	SDL_DisplayMode display_mode;
 	SDL_Event event;
+	POINT mouse_point;
 	struct state_t state;
 	struct hotkey_event_arg_t hkarg;
 	s32 i, rc;
-	MSG msg;
+	s16 ks;
 
 	struct hotkey_t hotkeys[] = {
-		  { 0x4000, VK_NUMPAD0, 1, 1,  0,  0, hotkey_fn_toggle }
-		, { 0x4000, VK_DECIMAL, 1, 1,  0,  0, hotkey_fn_quit }
-		, { 0x4000, VK_NUMPAD1, 0, 0, -1,  0, hotkey_fn_swap } // bank  -1
-		, { 0x4000, VK_NUMPAD2, 0, 0,  1,  0, hotkey_fn_swap } // bank  +1
-		, { 0x4000, VK_NUMPAD4, 0, 0,  0, -1, hotkey_fn_swap } // macro -1
-		, { 0x4000, VK_NUMPAD5, 0, 0,  0,  1, hotkey_fn_swap } // macro +1
-		, { 0x4000, VK_NUMPAD8, 0, 0,  0,  0, hotkey_fn_say } // prints the macro
+		  { HOTKEY_TOGGLE, 0x4000, hotkey_fn_togglewheel }
+		, { HOTKEY_QUIT,   0x4000, hotkey_fn_quit }
 	};
 
-	memset(&msg, 0, sizeof msg);
 	memset(&state, 0, sizeof state);
 
-	rc = macros_parse(&state, MACRO_FILE);
+	rc = macros_read(&state, MACRO_FILE);
 	if (rc < 0) {
 		ERR("Couldn't parse macro file!\n");
 		exit(1);
@@ -139,12 +162,10 @@ int main(int argc, char **argv)
 
 	// turn on all of the hotkeys that are "always on"
 	for (i = 0; i < ARRSIZE(hotkeys); i++) {
-		if (hotkeys[i].on_always) {
-			rc = RegisterHotKey(NULL, i, hotkeys[i].modifiers, hotkeys[i].vk);
-			if (!rc) {
-				ERR("Couldn't Register Hotkey %d :(\n", i);
-				exit(1);
-			}
+		rc = RegisterHotKey(NULL, i, hotkeys[i].modifiers, hotkeys[i].vk);
+		if (!rc) {
+			ERR("Couldn't Register Hotkey %d :(\n", i);
+			exit(1);
 		}
 	}
 
@@ -157,115 +178,167 @@ int main(int argc, char **argv)
 
 	SDL_SetWindowsMessageHook(Win32_CustomEventHandler, &hkarg);
 
-#if 1
-	while (!state.quit) {
+	SDL_GetCurrentDisplayMode(0, &display_mode);
+	state.display_w = display_mode.w;
+	state.display_h = display_mode.h;
+
+	SDL_CaptureMouse(SDL_TRUE);
+
+	for (state.is_running = 1; state.is_running;) {
+
+		// NOTE (brian) we don't really use SDL events at the moment. there's some nonsense about
+		// how SDL doesn't report events unless you're in like, a visible region of the window, and
+		// it's just crazy enough that it won't really work for this. But, it's here to capture the
+		// SDL_QUIT event, just in case someone sends (the Win32 version of) a SIGINT
+
 		while (SDL_PollEvent(&event)) {
-			printf("event type :: %d\n", event.type);
+			switch (event.type) {
+				case SDL_QUIT: {
+					state.is_running = 0;
+					break;
+				}
+				default: {
+					break;
+				}
+			}
 		}
-	}
-#else
-	// this is the Pre-SDL code, keeping it here for posterity
-	while (!state.quit && GetMessage(&msg, NULL, 0, 0) != 0) {
-		switch (msg.message) {
-		case WM_HOTKEY:
-			hotkeys[msg.wParam].func(&state, hotkeys, ARRSIZE(hotkeys), msg.wParam);
-			break;
+
+		// NOTE (brian) we need to take the vk code and stuff it into state, but I won't be ready
+		// to do that until we have a nice-ish way to map between some strings, and these virtual
+		// keycodes
+
+		if (state.is_active) {
+			rc = GetCursorPos(&mouse_point);
+			if (rc) {
+				state.mouse_x = mouse_point.x;
+				state.mouse_y = mouse_point.y;
+			}
+
+			printf("M: (%04d,%04d)\n", state.mouse_x, state.mouse_y);
+
+			ks = GetAsyncKeyState(HOTKEY_TOGGLE);
+			if (state.is_active && ks == 0) {
+				hotkey_fn_togglewheel(&state);
+			}
+
+			Render(&state);
 		}
+
+		state.nonce++;
+		SDL_Delay(8);
 	}
-#endif
+
+	if (state.gRenderer) {
+		SDL_DestroyRenderer(state.gRenderer);
+	}
+
+	if (state.gWindow) {
+		SDL_DestroyWindow(state.gWindow);
+	}
 
 	SDL_Quit();
 
 	// turn off all of the hotkeys
 	for (i = 0; i < ARRSIZE(hotkeys); i++) {
-		if (hotkeys[i].on_now) {
-			rc = UnregisterHotKey(NULL, i);
-			if (!rc) {
-				ERR("Couldn't Unregister Hotkey %d :(\n", i);
-				exit(1);
-			}
+		rc = UnregisterHotKey(NULL, i);
+		if (!rc) {
+			ERR("Couldn't Unregister Hotkey %d :(\n", i);
+			exit(1);
 		}
 	}
 
 	return 0;
 }
 
-/* hotkey_fn_toggle : toggles the availabliliy of the other hotkeys */
-s32 hotkey_fn_toggle(struct state_t *state, struct hotkey_t *hotkeys, s32 len, s32 idx)
+/* Render : renders the transparent screen */
+s32 Render(struct state_t *state)
 {
-	s32 i, rc;
+	SDL_Renderer *render;
+	SDL_Rect r;
 
-	// NOTE (brian): toggle all of the hotkeys that aren't supposed to be kept on
+	assert(state);
 
-	for (i = 0; i < len; i++) {
-		if (i == idx)
-			continue;
+	if (!state->gWindow && !state->gRenderer) {
+		return -1;
+	}
 
-		if (hotkeys[i].on_always)
-			continue;
+	render = state->gRenderer;
 
-		if (!hotkeys[i].on_now) {
-			rc = RegisterHotKey(NULL, i, hotkeys[i].modifiers, hotkeys[i].vk);
-		} else {
-			rc = UnregisterHotKey(NULL, i);
-		}
+	SDL_SetRenderDrawColor(render, 255, 0, 255, 255);
+	SDL_RenderClear(render);
 
-		hotkeys[i].on_now = !hotkeys[i].on_now;
+	r.x = 0;
+	r.y = 0;
+	r.w = 64;
+	r.h = 64;
 
-		if (!rc) {
-			sys_lasterror();
-			ERR("Couldn't Toggle Hotkey %d :(\n", i);
-		}
+	SDL_SetRenderDrawColor(render, 0, 255, 255, 255);
+	SDL_RenderFillRect(render, &r);
+
+	SDL_RenderPresent(render);
+
+	return 0;
+}
+
+/* hotkey_fn_togglewheel : toggles the chat wheel & sets up SDL state for the wheel */
+s32 hotkey_fn_togglewheel(struct state_t *state)
+{
+	SDL_Window *window;
+	s32 w, h;
+
+	// NOTE (brian) inside here, depending on state->is_active, we:
+	//
+	//   - show / hide the window
+	//   - draw the wheel
+	//   - save the mouse position, center the mouse, etc
+
+	assert(state);
+
+	window = state->gWindow;
+
+	state->is_active = !state->is_active;
+	state->nonce = 0;
+
+	printf("active: %d\n", state->is_active);
+	printf("win w: %d\n", state->display_w);
+	printf("win h: %d\n", state->display_h);
+
+	w = state->display_w;
+	h = state->display_h;
+
+	if (state->is_active) {
+		state->gWindow   = SDL_CreateWindow(WINDOW_TITLE, 0, 0, w, h, SDL_WINDOW_PARAMS);
+		state->gRenderer = SDL_CreateRenderer(state->gWindow, -1, SDL_RENDERER_ACCELERATED);
+
+		Win32_MakeWindowTransparent(state->gWindow, 255, 0, 255);
+
+		SDL_GetMouseState(&state->mouse_bak_x, &state->mouse_bak_y);
+		SDL_WarpMouseInWindow(state->gWindow, state->display_w / 2, state->display_h / 2);
+
+	} else {
+
+		SDL_WarpMouseInWindow(state->gWindow, state->mouse_bak_x, state->mouse_bak_y);
+
+		SDL_DestroyWindow(state->gWindow);
+		SDL_DestroyRenderer(state->gRenderer);
+
+		state->gWindow   = NULL;
+		state->gRenderer = NULL;
 	}
 
 	return 0;
 }
 
 /* hotkey_fn_quit : toggles the availabliliy of the other hotkeys */
-s32 hotkey_fn_quit(struct state_t *state, struct hotkey_t *hotkeys, s32 len, s32 idx)
+s32 hotkey_fn_quit(struct state_t *state)
 {
-	state->quit = 1;
-	return 0;
-}
-
-/* hotkey_fn_swap : swaps between banks */
-s32 hotkey_fn_swap(struct state_t *state, struct hotkey_t *hotkeys, s32 len, s32 idx)
-{
-	s32 b, m;
-	struct bank_t *lbank;
-
-	b = hotkeys[idx].arg1;
-	m = hotkeys[idx].arg2;
-
-	// We attempt to apply both motions. Unless the values in the array are not quite what we
-	// expect, we'll end up adding zero and whatnot.
-	//
-	// At the very least, this gives the "swapping" function a very constant time.
-
-	// Handle the Bank Swap First
-	state->curr += b;
-	if (state->curr < 0) {
-		state->curr = state->banks_len - 1;
-	}
-	if (state->banks_len <= state->curr) {
-		state->curr = 0;
-	}
-
-	// Then the Macro Clamping
-	lbank = state->banks + state->curr;
-	lbank->curr += m;
-	if (lbank->curr < 0) {
-		lbank->curr = lbank->lines_len - 1;
-	}
-	if (lbank->lines_len <= lbank->curr) {
-		lbank->curr = 0;
-	}
-
+	assert(state);
+	state->is_running = 0;
 	return 0;
 }
 
 /* hotkey_fn_say : says the selected macro */
-s32 hotkey_fn_say(struct state_t *state, struct hotkey_t *hotkeys, s32 len, s32 idx)
+s32 hotkey_fn_say(struct state_t *state)
 {
 	INPUT *inputs;
 	size_t inputs_len, inputs_cap;
@@ -282,7 +355,10 @@ s32 hotkey_fn_say(struct state_t *state, struct hotkey_t *hotkeys, s32 len, s32 
 	// https://docs.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-input
 	// https://docs.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-keybdinput
 
-	s = state->banks[state->curr].lines[state->banks[state->curr].curr];
+	assert(state);
+	assert(state->lines);
+
+	s = state->lines[state->curr];
 	slen = strlen(s);
 
 	inputs = NULL;
@@ -360,29 +436,17 @@ s32 sendkey_single(s32 keycode)
 	return 0;
 }
 
-/* macros_parse : parse macros from the input file to the state */
-s32 macros_parse(struct state_t *state, char *fname)
+/* macros_read : parse macros from the input file to the state */
+s32 macros_read(struct state_t *state, char *fname)
 {
 	FILE *fp;
-	struct bank_t *lbank;
 	char *s;
 	char buf[BUFLARGE];
 
-	// NOTE (brian):
-	//
-	// The macro file format is as follows:
-	//
-	// Example:
-	//
-	// BankFoo
-	//     You're trash.
-	//     I'd say you were cancer, but cancer wins sometimes.
-	//
-	// BankBar
-	//     glhf
-	//     Good Luck Having Fun
-	//
-	// That gets parsed into two banks, with two macros a piece
+	// NOTE (brian): read lines of text from the filename, and put them into the state structure
+
+	assert(state);
+	assert(fname);
 
 	memset(state, 0, sizeof(*state));
 
@@ -392,59 +456,11 @@ s32 macros_parse(struct state_t *state, char *fname)
 
 	while (buf == fgets(buf, sizeof buf, fp)) {
 		s = rtrim(buf);
-
-		switch (s[0]) {
-			case '\0':
-			case '#':
-				continue;
-
-			default: // new bank
-				C_RESIZE(&state->banks);
-				state->banks[state->banks_len].name = strdup(s);
-				state->banks[state->banks_len].curr = 0;
-				state->banks[state->banks_len].lines_len = 0;
-				state->banks[state->banks_len].lines_cap = 0;
-				state->banks_len++;
-				state->curr = state->banks_len - 1; // use curr in the next case
-				break;
-
-			case '\t': // new macro in the bank
-				s = ltrim(buf);
-				C_RESIZE(&state->banks[state->curr].lines);
-				lbank = state->banks + state->curr;
-				lbank->lines[lbank->lines_len++] = strdup(s);
-				break;
-		}
+		C_RESIZE(&state->lines);
+		state->lines[state->lines_len++] = strdup(s);
 	}
-
-	// reset curr to the first bank, like we expect
-	state->curr = 0;
 
 	fclose(fp);
-
-	return 0;
-}
-
-/* state_dump : dumps the state of the 'state' object */
-s32 state_dump(struct state_t *state)
-{
-	s32 i, j;
-
-	if (!state) {
-		return -1;
-	}
-
-	printf("state.curr    : %d\n", state->curr);
-	printf("state.s_bank  : %d\n", state->s_bank);
-	printf("state.s_macro : %d\n", state->s_macro);
-	printf("state.quit    : %d\n", state->quit);
-
-	for (i = 0; i < state->banks_len; i++) {
-		printf("%s\n", state->banks[i].name);
-		for (j = 0; j < state->banks[i].lines_len; j++) {
-			printf("\t%s\n", state->banks[i].lines[j]);
-		}
-	}
 
 	return 0;
 }
@@ -484,14 +500,34 @@ void Win32_CustomEventHandler(void *user, void *hwnd, u32 message, u64 wparam, s
 {
 	struct hotkey_event_arg_t *hkarg;
 
-	if (message == WM_HOTKEY) {
-		printf("Got WM_HOTKEY!!!\n");
-		// ORIGINAL CODE:
-		//   hotkeys[msg.wParam].func(&state, hotkeys, ARRSIZE(hotkeys), msg.wParam);
-		//
-		// NEW CODE:
-		hkarg = user;
-		hkarg->hotkeys[wparam].func(hkarg->state, hkarg->hotkeys, hkarg->hotkeys_len, wparam);
+	assert(user);
+	hkarg = user;
+
+	if (message == WM_HOTKEY && !hkarg->state->is_active) {
+		hkarg->hotkeys[wparam].func(hkarg->state);
 	}
+}
+
+/* Win32_MakeWindowTransparent : makes the sdl window transparent */
+int Win32_MakeWindowTransparent(SDL_Window *window, u8 r, u8 g, u8 b)
+{
+	HWND hwnd;
+
+	hwnd = Win32_GetWindowHWND(window);
+
+	SetWindowLong(hwnd, GWL_EXSTYLE, GetWindowLong(hwnd, GWL_EXSTYLE)|WS_EX_LAYERED);
+
+	return SetLayeredWindowAttributes(hwnd, RGB(r, g, b), 0, LWA_COLORKEY);
+}
+
+/* Win32_GetWindowHWND : get the window handle */
+HWND Win32_GetWindowHWND(SDL_Window *window)
+{
+	SDL_SysWMinfo wminfo;
+
+	SDL_VERSION(&wminfo.version);
+	SDL_GetWindowWMInfo(window, &wminfo);
+
+	return wminfo.info.win.window;
 }
 
