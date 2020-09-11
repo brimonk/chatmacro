@@ -38,11 +38,8 @@
  * 5. Start Applications (Custom Run Dialog for Specially Hooked up Programs??)
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-#include <ctype.h>
+#define SDL_MAIN_HANDLED
+#include <SDL2/SDL.h>
 
 #define COMMON_IMPLEMENTATION
 #include "common.h"
@@ -79,6 +76,12 @@ struct hotkey_t {
 	s32 (*func)(struct state_t *state, struct hotkey_t *hotkeys, s32 len, s32 idx);
 };
 
+struct hotkey_event_arg_t {
+	struct state_t *state;
+	struct hotkey_t *hotkeys;
+	s32 hotkeys_len;
+};
+
 /* sys_lasterror : handles errors that aren't propogated through win32 errno */
 static void sys_lasterror();
 
@@ -103,9 +106,15 @@ void mk_kbdinput(INPUT *input, s16 vk, s16 sk, s32 key_up);
 /* sendkey_single : sends a single key */
 s32 sendkey_single(s32 keycode);
 
+// WIN32 Custom
+/* Win32_CustomEventHandler : custom event handler to grab windows events in sdl */
+void Win32_CustomEventHandler(void *user, void *hwnd, u32 message, u64 wparam, s64 lparam);
+
 int main(int argc, char **argv)
 {
+	SDL_Event event;
 	struct state_t state;
+	struct hotkey_event_arg_t hkarg;
 	s32 i, rc;
 	MSG msg;
 
@@ -139,6 +148,23 @@ int main(int argc, char **argv)
 		}
 	}
 
+	SDL_Init(SDL_INIT_EVERYTHING);
+
+	// hkarg setup (for handling WM_HOTKEY)
+	hkarg.state = &state;
+	hkarg.hotkeys = hotkeys;
+	hkarg.hotkeys_len = ARRSIZE(hotkeys);
+
+	SDL_SetWindowsMessageHook(Win32_CustomEventHandler, &hkarg);
+
+#if 1
+	while (!state.quit) {
+		while (SDL_PollEvent(&event)) {
+			printf("event type :: %d\n", event.type);
+		}
+	}
+#else
+	// this is the Pre-SDL code, keeping it here for posterity
 	while (!state.quit && GetMessage(&msg, NULL, 0, 0) != 0) {
 		switch (msg.message) {
 		case WM_HOTKEY:
@@ -146,6 +172,9 @@ int main(int argc, char **argv)
 			break;
 		}
 	}
+#endif
+
+	SDL_Quit();
 
 	// turn off all of the hotkeys
 	for (i = 0; i < ARRSIZE(hotkeys); i++) {
@@ -448,5 +477,21 @@ void mk_kbdinput(INPUT *input, s16 vk, s16 sk, s32 key_up)
 	input->ki.dwFlags = key_up ? KEYEVENTF_KEYUP : 0;
 	input->ki.time = 0;
 	input->ki.dwExtraInfo = 0;
+}
+
+/* Win32_CustomEventHandler : custom event handler to grab windows events in sdl */
+void Win32_CustomEventHandler(void *user, void *hwnd, u32 message, u64 wparam, s64 lparam)
+{
+	struct hotkey_event_arg_t *hkarg;
+
+	if (message == WM_HOTKEY) {
+		printf("Got WM_HOTKEY!!!\n");
+		// ORIGINAL CODE:
+		//   hotkeys[msg.wParam].func(&state, hotkeys, ARRSIZE(hotkeys), msg.wParam);
+		//
+		// NEW CODE:
+		hkarg = user;
+		hkarg->hotkeys[wparam].func(hkarg->state, hkarg->hotkeys, hkarg->hotkeys_len, wparam);
+	}
 }
 
